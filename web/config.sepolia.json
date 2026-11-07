@@ -1,0 +1,49 @@
+{
+  "network": "sepolia",
+  "chainId": 11155111,
+  "explorer": "https://eth-sepolia.blockscout.com",
+  "note": "Contract addresses are filled from the IMD launch hand-off after deployment. Do not invent them.",
+  "contracts": {
+    "CheeseEmissionController": {"address": null, "abi": "abi/CheeseEmissionController.json"},
+    "CheeseToken": {"address": null, "abi": "abi/CheeseToken.json"},
+    "CheeseFarmERC20": {"address": null, "abi": "abi/CheeseFarmERC20.json", "pool": "CHEESE", "poolId": 0, "points": 400},
+    "CheeseFarmETH": {"address": null, "abi": "abi/CheeseFarmETH.json", "pool": "ETH", "poolId": 1, "points": 200},
+    "CheeseFarmSIMD": {"address": null, "abi": "abi/CheeseFarmSIMD.json", "pool": "sIMD", "poolId": 2, "points": 200}
+  },
+  "futurePoolReserve": {"points": 200, "minted": false},
+  "squeekchain": {
+    "release": "core-sepolia-20261103",
+    "squeekCore": "0xFD6C166D4B8E2962E65746a13e5a0797CD4dE0c4",
+    "squeekMining": "0x2dCcB11fcC2dEfdd188555e45aCb52231e82e218",
+    "squeekToken": "0xd78a3956cF63164d1Fa1C622ad3c66623162Fa1e",
+    "genesisTimestamp": 1793735400,
+    "roundDurationSeconds": 600,
+    "blockUnitsPerBlock": "1000000000",
+    "docs": "https://docs.squeekchain.com/",
+    "deployments": "https://docs.squeekchain.com/assets/deployments/sepolia.json"
+  },
+  "token": {"name": "CHEESE", "symbol": "CHEESE", "decimals": 18, "maxSupply": "2100000000000000000000000000", "premint": "210000000000000000000000000"},
+  "schedule": {
+    "allowance": "1890000000000000000000000000",
+    "launchBonus": "105000000000000000000000000",
+    "bonusBlocks": 97020,
+    "halvingBlocks": 393470,
+    "halvingPeriods": 3,
+    "firstPeriodRate": "2592319617759930871476"
+  },
+  "fees": {"withdrawBps": 1500, "retainedBps": 1400, "treasuryBps": 100, "depositBps": 0},
+  "reads": {
+    "pendingCheckpoint": "CheeseEmissionController.pendingCheckpoint() -> (readable, toHeight, emission)",
+    "poolAllocation": "CheeseEmissionController.getPoolAllocation(poolId) -> (farm, weight, enabled, pendingEmission, minted)",
+    "allocation": "CheeseEmissionController.getAllocation() -> (active, disabled, reserve)",
+    "userRewards": "Farm.pendingRewards(account)",
+    "userShares": "Farm.sharesOf(account), Farm.assetsOf(account), Farm.previewWithdraw(shares)"
+  },
+  "writes": {
+    "checkpoint": "CheeseEmissionController.checkpoint()",
+    "depositERC20": "approve(farm, amount) then Farm.deposit(amount)",
+    "depositETH": "CheeseFarmETH.deposit{value}()",
+    "withdraw": "Farm.withdraw(shares)",
+    "claim": "Farm.claim(to)"
+  }
+}
