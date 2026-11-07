@@ -9,6 +9,7 @@ import {CheeseFarmETH} from "../src/farms/CheeseFarmETH.sol";
 import {CheeseToken} from "../src/CheeseToken.sol";
 import {CheeseEmissionController} from "../src/CheeseEmissionController.sol";
 import {MockSqueekCore} from "./mocks/MockSqueekCore.sol";
+import {ISqueekCore} from "../src/interfaces/ISqueekCore.sol";
 
 /// @notice Drives the whole system at once: both value-holding farms (CHEESE, where principal and rewards
 ///         share one token, and native ETH), allocation changes, guardian pauses, SqueekCore outages, CHEESE
@@ -174,8 +175,14 @@ contract SystemHandler is Test {
         _track();
     }
 
-    function toggleOutage(bool down) external {
-        core.setUnavailable(down);
+    /// @dev 0 healthy, 1 Core reverts, 2 Core answers state() with an oversized payload (read as unavailable
+    ///      without copying it), 3 Core answers state() one byte short.
+    function toggleOutage(uint8 mode) external {
+        mode = uint8(bound(mode, 0, 3));
+        vm.clearMockedCalls();
+        core.setUnavailable(mode == 1);
+        if (mode == 2) vm.mockCall(address(core), abi.encodeWithSelector(ISqueekCore.state.selector), new bytes(5000));
+        if (mode == 3) vm.mockCall(address(core), abi.encodeWithSelector(ISqueekCore.state.selector), new bytes(255));
     }
 
     // ---- administration ----

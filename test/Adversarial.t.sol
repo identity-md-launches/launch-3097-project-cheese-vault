@@ -614,8 +614,9 @@ contract AdversarialTest is CheeseBase {
     }
 
     /// @dev A Core that burns all forwarded gas (INVALID) still leaves the caller its 1/64: exits and the
-    ///      emergency pause go through within a 30M-gas transaction. (A Core that instead returns a huge
-    ///      payload does block them; that is reported in .imd-findings.json, not asserted here.)
+    ///      emergency pause go through within a 30M-gas transaction. (The huge-payload variant is covered by
+    ///      test_returnBombCoreDoesNotBlockExitsOrPause in Emission.t.sol, and the realistic per-transaction
+    ///      cap by test_gasBurningCoreExitsFitUnderTxGasCap below.)
     function test_gasBurningCoreDoesNotBlockExitsOrPause() public {
         activateWithHistory(0);
         depositEth(alice, 1 ether);
@@ -658,5 +659,143 @@ contract AdversarialTest is CheeseBase {
         vm.prank(alice);
         assertEq(ethFarm.claim(alice), (issued(10) * 200) / 1000);
         assertGt(withdrawAll(ethFarm, alice), 0);
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // Revision 2: the preview floors once, Core reads are size-bounded before any copy
+    // ------------------------------------------------------------------------------------------------
+
+    /// @dev pendingRewards must equal what claim pays, to the wei, whatever the pool weight, the depositors'
+    ///      sizes and the number of certified-but-unpriced blocks (including halving crossings and a partial
+    ///      withdrawal in between).
+    /// forge-config: default.fuzz.runs = 512
+    function testFuzz_pendingRewardsEqualsClaimWithUnsyncedBlocks(
+        uint256 a,
+        uint256 b,
+        uint16 weight,
+        uint64 synced,
+        uint64 unsynced,
+        uint16 withdrawBps
+    ) public {
+        a = bound(a, 1, 500 ether);
+        b = bound(b, 1, 500 ether);
+        activateWithHistory(0);
+        uint256 ethPool = controller.poolIdOf(address(ethFarm));
+        depositEth(alice, a);
+        depositEth(bob, b);
+        advanceBlocks(uint64(bound(synced, 0, 3 * H)));
+        // a weight change checkpoints under the old weight, then the new one applies
+        uint16 maxWeight = uint16(1000 - controller.totalWeight() + 200);
+        vm.prank(owner);
+        controller.setPoolWeight(ethPool, uint16(bound(weight, 0, maxWeight)));
+        uint256 shares = ethFarm.sharesOf(bob);
+        uint256 part = (shares * bound(withdrawBps, 0, 9_999)) / 10_000;
+        if (part != 0) {
+            vm.prank(bob);
+            ethFarm.withdraw(part);
+        }
+        advanceBlocks(uint64(bound(unsynced, 0, 3 * H)));
+
+        uint256 previewAlice = ethFarm.pendingRewards(alice);
+        uint256 previewBob = ethFarm.pendingRewards(bob);
+        vm.prank(alice);
+        assertEq(ethFarm.claim(alice), previewAlice, "alice: preview == claim");
+        vm.prank(bob);
+        assertEq(ethFarm.claim(bob), previewBob, "bob: preview == claim");
+        assertEq(ethFarm.pendingRewards(alice), 0);
+        assertEq(ethFarm.pendingRewards(bob), 0);
+    }
+
+    /// @dev state() is accepted only at its exact ABI size: one byte short, one byte over, or a valid encoding
+    ///      with a trailing word all read as unavailable (checkpoint false, no revert, nothing priced).
+    function test_stateReadAcceptsOnlyExactSize() public {
+        activateWithHistory(0);
+        depositEth(alice, 1 ether);
+        advanceBlocks(10);
+        bytes memory good = abi.encode(core.state());
+        assertEq(good.length, 256);
+        bytes4 sel = ISqueekCore.state.selector;
+
+        vm.mockCall(address(core), abi.encodeWithSelector(sel), new bytes(255));
+        (bool ok,) = controller.checkpoint();
+        assertFalse(ok, "255 bytes");
+        vm.mockCall(address(core), abi.encodeWithSelector(sel), new bytes(257));
+        (ok,) = controller.checkpoint();
+        assertFalse(ok, "257 bytes");
+        vm.mockCall(address(core), abi.encodeWithSelector(sel), bytes.concat(good, bytes32(0)));
+        (ok,) = controller.checkpoint();
+        assertFalse(ok, "valid + trailing word");
+        // a revert with an oversized reason is unavailable too, with the size reported
+        vm.mockCallRevert(address(core), abi.encodeWithSelector(sel), new bytes(1000));
+        vm.expectEmit(address(controller));
+        emit CheeseEmissionController.CoreUnavailable(abi.encodeWithSelector(
+                CheeseEmissionController.OversizedReturnData.selector, 1000, 256
+            ));
+        (ok,) = controller.checkpoint();
+        assertFalse(ok, "oversized revert");
+        assertEq(controller.cumulativeEmission(), 0, "nothing priced from bad reads");
+
+        vm.mockCall(address(core), abi.encodeWithSelector(sel), good);
+        (ok,) = controller.checkpoint();
+        assertTrue(ok, "exact size accepted");
+        assertEq(controller.cumulativeEmission(), issued(10));
+    }
+
+    /// @dev roundPage is bounded at 4096 bytes: a well-formed page of 23 records (4000 bytes) anchors h0 from
+    ///      its `end`, the same page with 24 records (4160 bytes) is unavailable and the anchor waits.
+    function test_roundPageBoundaryAcceptsAtBoundRejectsAbove() public {
+        vm.prank(owner);
+        controller.activate();
+        uint64 start = controller.startRound();
+        core.settle(start - 1, 9, 0);
+        bytes memory call_ = abi.encodeCall(ISqueekCore.roundPage, (start - 1, start - 1, 0));
+
+        vm.mockCall(address(core), call_, _page(24, 9));
+        assertEq(_page(24, 9).length, 4160);
+        (bool ok,) = controller.checkpoint();
+        assertFalse(ok, "4160-byte page rejected");
+        assertFalse(controller.startCaptured());
+        (bool readable,,) = controller.pendingCheckpoint();
+        assertFalse(readable, "preview agrees");
+
+        vm.mockCall(address(core), call_, _page(23, 9));
+        assertEq(_page(23, 9).length, 4000);
+        (ok,) = controller.checkpoint();
+        assertTrue(ok, "4000-byte page accepted");
+        assertTrue(controller.startCaptured());
+        assertEq(controller.startHeight(), 9, "h0 from page.end");
+    }
+
+    function _page(uint256 records, uint64 endHeight) internal pure returns (bytes memory) {
+        ISqueekCore.RoundPage memory p;
+        p.end.cumulativeBlockUnits = uint96(endHeight) * 1_000_000_000;
+        p.rounds = new ISqueekCore.RoundCheckpoint[](records);
+        return abi.encode(p);
+    }
+
+    /// @dev Sepolia runs Fusaka, whose EIP-7825 caps a transaction at 2^24 gas. A Core that burns all gas
+    ///      forwarded to it must still leave withdraw, claim and the emergency pause enough of a capped
+    ///      transaction to finish (SECURITY.md item 8 claims they are slowed, not blocked).
+    function test_gasBurningCoreExitsFitUnderTxGasCap() public {
+        uint256 cap = (1 << 24) - 60_000; // less the intrinsic and calldata cost of a real transaction
+        activateWithHistory(0);
+        depositEth(alice, 1 ether);
+        depositCheese(bob, 1_000 ether);
+        advanceBlocks(10);
+        controller.checkpoint();
+        uint256 earned = ethFarm.pendingRewards(alice);
+        vm.etch(address(core), hex"fe");
+
+        vm.prank(alice);
+        assertEq(ethFarm.claim{gas: cap}(alice), earned, "claim under cap");
+        uint256 shares = ethFarm.sharesOf(alice);
+        vm.prank(alice);
+        assertEq(ethFarm.withdraw{gas: cap}(shares), 0.85 ether, "last-depositor withdraw under cap");
+        uint256 cheeseShares = cheeseFarm.sharesOf(bob);
+        vm.prank(bob);
+        assertGt(cheeseFarm.withdraw{gas: cap}(cheeseShares / 2), 0, "partial CHEESE withdraw under cap");
+        vm.prank(owner);
+        controller.pauseEmissions{gas: cap}();
+        assertTrue(controller.emissionsPaused());
     }
 }
