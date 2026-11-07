@@ -198,6 +198,20 @@ contract AllocationTest is CheeseBase {
         controller.enablePool(ETH_POOL);
     }
 
+    function test_batchRejectsDuplicatePoolIds() public {
+        uint256[] memory ids = new uint256[](2);
+        uint16[] memory weights = new uint16[](2);
+        ids[0] = CHEESE_POOL;
+        ids[1] = CHEESE_POOL;
+        weights[0] = 500;
+        weights[1] = 100;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(CheeseEmissionController.DuplicatePoolId.selector, CHEESE_POOL));
+        controller.batchSetPoolWeights(ids, weights);
+        (, uint16 weight,,,) = controller.getPoolAllocation(CHEESE_POOL);
+        assertEq(weight, 400, "unchanged");
+    }
+
     function test_allocationChangesRevertWhilePausedOrCoreUnavailable() public {
         activateWithHistory(0);
         advanceBlocks(5);

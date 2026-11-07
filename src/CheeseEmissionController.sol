@@ -39,6 +39,9 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
     /// @notice SqueekCore constants the schedule depends on; verified at activation.
     uint64 public constant ROUND_DURATION = 600;
     uint96 public constant BLOCK_UNITS_PER_BLOCK = 1_000_000_000;
+    /// @dev Exact ABI sizes of SqueekCore's static return structs; any other size is treated as unavailable.
+    uint256 internal constant CORE_STATE_BYTES = 8 * 32;
+    uint256 internal constant CORE_CONFIGURATION_BYTES = 11 * 32;
 
     uint256 public constant MINING_ALLOWANCE = SqueekIssuance.ALLOWANCE;
     uint256 public constant LAUNCH_BONUS = SqueekIssuance.LAUNCH_BONUS;
@@ -132,6 +135,7 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
     error NotPoolFarm(uint256 poolId, address caller);
     error LengthMismatch();
     error EmptyBatch();
+    error DuplicatePoolId(uint256 poolId);
 
     // ------------------------------------------------------------------------------------------------
     // Construction
@@ -180,12 +184,8 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
     function activate() external onlyOwner {
         if (address(cheese) == address(0)) revert TokenNotBound();
         if (activated) revert AlreadyActivated();
-        ISqueekCore.CoreConfiguration memory config;
-        try squeekCore.configuration() returns (ISqueekCore.CoreConfiguration memory c) {
-            config = c;
-        } catch {
-            revert SqueekCoreUnavailable();
-        }
+        (bool ok, ISqueekCore.CoreConfiguration memory config) = _readConfiguration();
+        if (!ok) revert SqueekCoreUnavailable();
         if (config.roundDuration != ROUND_DURATION || config.blockUnitsPerBlock != BLOCK_UNITS_PER_BLOCK) {
             revert SqueekCoreIdentityMismatch();
         }
@@ -198,10 +198,12 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
 
     /// @notice Emergency stop. While paused no emission is priced or minted, farms refuse deposits, and
     ///         allocation changes revert; withdrawals and claims keep working. Unpausing catches up the
-    ///         blocks certified meanwhile, so the schedule still matches SQK one for one.
+    ///         blocks certified meanwhile, so the schedule still matches SQK one for one. Blocks certified
+    ///         before the pause are priced first (best effort), so they stay with whoever was staked then.
     function pauseEmissions() external {
         if (msg.sender != guardian && msg.sender != owner()) revert NotGuardianOrOwner(msg.sender);
         if (emissionsPaused) revert EmissionsArePaused();
+        _sync();
         emissionsPaused = true;
         emit EmissionsPaused(msg.sender);
     }
@@ -248,6 +250,12 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
     function batchSetPoolWeights(uint256[] calldata poolIds, uint16[] calldata weights) external onlyOwner {
         if (poolIds.length != weights.length) revert LengthMismatch();
         if (poolIds.length == 0) revert EmptyBatch();
+        // The two passes below are order-independent, so a repeated id would have no defined winner.
+        for (uint256 i; i < poolIds.length; ++i) {
+            for (uint256 j = i + 1; j < poolIds.length; ++j) {
+                if (poolIds[i] == poolIds[j]) revert DuplicatePoolId(poolIds[i]);
+            }
+        }
         _requireSync();
         // Lower weights first so a reallocation whose sum stays within TOTAL_POINTS never fails midway.
         for (uint256 i; i < poolIds.length; ++i) {
@@ -292,13 +300,15 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
 
     /// @notice Farm hook: settles the pool and mints its accrued CHEESE to the farm. When the farm has no
     ///         stakers the accrual is forfeited (never minted) so a later depositor cannot inherit it.
-    function pullRewards(uint256 poolId, bool hasStakers) external returns (uint256 amount) {
+    ///         `synced` reports whether every certified block is now priced; farms refuse deposits when it
+    ///         is false and let withdrawals and claims through regardless.
+    function pullRewards(uint256 poolId, bool hasStakers) external returns (uint256 amount, bool synced) {
         Pool storage pool = _pool(poolId);
         if (msg.sender != pool.farm) revert NotPoolFarm(poolId, msg.sender);
-        _sync(); // best effort: withdrawals must never be blocked by Squeekchain availability
+        (synced,) = _sync(); // best effort: withdrawals must never be blocked by Squeekchain availability
         if (pool.enabled) _settle(poolId, pool);
         amount = pool.accrued;
-        if (amount == 0) return 0;
+        if (amount == 0) return (0, synced);
         pool.accrued = 0;
         if (hasStakers) {
             pool.minted += amount;
@@ -380,22 +390,16 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
     /// @notice What a checkpoint would emit now, and whether SqueekCore could be read.
     function pendingCheckpoint() external view returns (bool readable, uint64 toHeight, uint256 emission) {
         if (!activated || completed || emissionsPaused) return (true, lastHeight, 0);
-        ISqueekCore.CoreState memory s;
-        try squeekCore.state() returns (ISqueekCore.CoreState memory result) {
-            s = result;
-        } catch {
-            return (false, lastHeight, 0);
-        }
+        (bool ok, ISqueekCore.CoreState memory s,) = _readState();
+        if (!ok) return (false, lastHeight, 0);
         uint64 h0 = startHeight;
         uint64 from = lastHeight;
         if (!startCaptured) {
             if (s.settledThroughRound < startRound - 1) return (true, 0, 0);
-            try squeekCore.roundPage(startRound - 1, startRound - 1, 0) returns (ISqueekCore.RoundPage memory page) {
-                h0 = uint64(page.end.cumulativeBlockUnits / BLOCK_UNITS_PER_BLOCK);
-                from = h0;
-            } catch {
-                return (false, 0, 0);
-            }
+            (bool pageOk, uint64 height,) = _readHeightAtRound(startRound - 1);
+            if (!pageOk) return (false, 0, 0);
+            h0 = height;
+            from = h0;
         }
         if (s.blockHeight <= from) return (true, from, 0);
         emission = _clip(SqueekIssuance.issuedBetween(from - h0, s.blockHeight - h0));
@@ -405,6 +409,23 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
     function currentRound() external view returns (uint64) {
         if (!activated) revert NotActivated();
         return _currentRound(genesisTimestamp);
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // ABI decoding helpers (called only through `this`, so a malformed payload reverts here, not in the
+    // user's transaction; see _readState)
+    // ------------------------------------------------------------------------------------------------
+
+    function decodeCoreState(bytes calldata data) external pure returns (ISqueekCore.CoreState memory) {
+        return abi.decode(data, (ISqueekCore.CoreState));
+    }
+
+    function decodeCoreConfiguration(bytes calldata data) external pure returns (ISqueekCore.CoreConfiguration memory) {
+        return abi.decode(data, (ISqueekCore.CoreConfiguration));
+    }
+
+    function decodeRoundPage(bytes calldata data) external pure returns (ISqueekCore.RoundPage memory) {
+        return abi.decode(data, (ISqueekCore.RoundPage));
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -459,16 +480,53 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
         return emission > remaining ? remaining : emission;
     }
 
+    /// @dev Reads SqueekCore.state() defensively. Solidity's try/catch does not cover return data that fails
+    ///      to decode or a target without code (both revert in the caller), so the call is a raw staticcall
+    ///      whose payload must have the exact ABI size and decode through `this.decodeCoreState`. Any failure
+    ///      reads as "unavailable" with the raw payload as the reason, and never blocks a user action.
+    function _readState() internal view returns (bool ok, ISqueekCore.CoreState memory s, bytes memory reason) {
+        (bool success, bytes memory data) = address(squeekCore).staticcall(abi.encodeCall(ISqueekCore.state, ()));
+        if (!success || data.length != CORE_STATE_BYTES) return (false, s, data);
+        try this.decodeCoreState(data) returns (ISqueekCore.CoreState memory decoded) {
+            return (true, decoded, "");
+        } catch {
+            return (false, s, data);
+        }
+    }
+
+    /// @dev Same defensive read for SqueekCore.configuration() (used only by activate()).
+    function _readConfiguration() internal view returns (bool ok, ISqueekCore.CoreConfiguration memory c) {
+        (bool success, bytes memory data) =
+            address(squeekCore).staticcall(abi.encodeCall(ISqueekCore.configuration, ()));
+        if (!success || data.length != CORE_CONFIGURATION_BYTES) return (false, c);
+        try this.decodeCoreConfiguration(data) returns (ISqueekCore.CoreConfiguration memory decoded) {
+            return (true, decoded);
+        } catch {
+            return (false, c);
+        }
+    }
+
+    /// @dev Completed Squeek height at the end of `round`, from roundPage(round, round, 0).end, read the same
+    ///      defensive way (the page is dynamically encoded, so only the decode helper can validate it).
+    function _readHeightAtRound(uint64 round) internal view returns (bool ok, uint64 height, bytes memory reason) {
+        (bool success, bytes memory data) =
+            address(squeekCore).staticcall(abi.encodeCall(ISqueekCore.roundPage, (round, round, 0)));
+        if (!success || data.length == 0) return (false, 0, data);
+        try this.decodeRoundPage(data) returns (ISqueekCore.RoundPage memory page) {
+            return (true, uint64(page.end.cumulativeBlockUnits / BLOCK_UNITS_PER_BLOCK), "");
+        } catch {
+            return (false, 0, data);
+        }
+    }
+
     /// @dev Reads SqueekCore and prices newly certified blocks. Returns (true, x) when accounting is current,
     ///      (false, 0) when it could not be brought current (paused, Core unreadable, Core regressed).
     function _sync() internal returns (bool, uint256) {
         if (!activated || completed) return (true, 0);
         if (emissionsPaused) return (false, 0);
 
-        ISqueekCore.CoreState memory s;
-        try squeekCore.state() returns (ISqueekCore.CoreState memory result) {
-            s = result;
-        } catch (bytes memory reason) {
+        (bool ok, ISqueekCore.CoreState memory s, bytes memory reason) = _readState();
+        if (!ok) {
             emit CoreUnavailable(reason);
             return (false, 0);
         }
@@ -476,11 +534,9 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
         if (!startCaptured) {
             // Mirror SqueekMining: h0 is the completed height at the end of round startRound - 1.
             if (s.settledThroughRound < startRound - 1) return (true, 0);
-            uint64 h0;
-            try squeekCore.roundPage(startRound - 1, startRound - 1, 0) returns (ISqueekCore.RoundPage memory page) {
-                h0 = uint64(page.end.cumulativeBlockUnits / BLOCK_UNITS_PER_BLOCK);
-            } catch (bytes memory reason) {
-                emit CoreUnavailable(reason);
+            (bool pageOk, uint64 h0, bytes memory pageReason) = _readHeightAtRound(startRound - 1);
+            if (!pageOk) {
+                emit CoreUnavailable(pageReason);
                 return (false, 0);
             }
             startCaptured = true;

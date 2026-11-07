@@ -24,7 +24,7 @@ here reuses or touches the existing BLOOM contracts.
 | `src/interfaces/ISqueekCore.sol`, `ISqueekMining.sol` | Subsets of the published Squeekchain ABIs |
 | `script/Deploy.s.sol` | Deploy + wire + hand-over, callable from tests; Sepolia rehearsal `run()` |
 | `script/VerifySqueekchain.s.sol` | Read-only live check that CHEESE's schedule equals SQK's |
-| `test/` | 70 unit, fuzz and invariant tests |
+| `test/` | 87 unit, fuzz and invariant tests |
 | `web/abi/*.json`, `web/config.sepolia.json` | Website integration ABI and configuration |
 | `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/SQUEEKCHAIN_VERIFICATION.md` | Design, findings, verified references |
 
@@ -73,19 +73,24 @@ compiled constant. No address, ABI function or emission parameter was invented.
   enabled pool) stays unminted; `reserveUnminted` records it and it is never redistributed.
 * Emission completes when `height - h0 >= 3H`; `EmissionCompleted` is emitted once and later
   checkpoints are no-ops. Farms keep working (fees, withdrawals, claims).
-* Squeekchain unavailable or regressed: `checkpoint()` returns `false`, emits `CoreUnavailable` or
-  `CoreRegression`, changes nothing, and the next successful call catches up. Allocation changes and
-  deposits require a successful sync; withdrawals and claims never do.
-* Pause (`pauseEmissions`, owner or guardian; `unpauseEmissions`, owner only): no emission is priced,
-  farms refuse deposits, allocation changes revert; withdrawals and claims keep working. Unpausing
-  catches up, so the schedule still matches SQK.
+* Squeekchain unavailable, regressed, without code, or returning data of another shape (a proxy
+  upgrade that changes a struct): `checkpoint()` returns `false`, emits `CoreUnavailable` or
+  `CoreRegression`, changes nothing, and the next successful call catches up. SqueekCore is read
+  through raw `staticcall`s whose payloads must have the exact ABI size and decode (via the
+  `decode*` helpers), because Solidity's `try/catch` would otherwise revert in the user's
+  transaction. Allocation changes and deposits require a successful sync (deposits revert with
+  `SyncRequired`); withdrawals and claims never do.
+* Pause (`pauseEmissions`, owner or guardian; `unpauseEmissions`, owner only): the pause first prices
+  the blocks certified before it (best effort), so they belong to whoever was staked then. While
+  paused no emission is priced, farms refuse deposits, allocation changes revert; withdrawals and
+  claims keep working. Unpausing catches up, so the schedule still matches SQK.
 
 ### Pool allocation
 
 Initial allocation (set by the owner after launch, see below): CHEESE 400, ETH 200, sIMD 200,
 Future Pool Reserve 200 of `TOTAL_POINTS` 1000. API: `addPool`, `setPoolWeight`,
-`batchSetPoolWeights`, `disablePool`, `enablePool`, `checkpoint`, `getPoolAllocation`,
-`getAllocation`, `previewPoolEmission`, `pendingCheckpoint`.
+`batchSetPoolWeights` (distinct pool ids only), `disablePool`, `enablePool`, `checkpoint`,
+`getPoolAllocation`, `getAllocation`, `previewPoolEmission`, `pendingCheckpoint`.
 
 Accounting is a single `emissionPerPoint` accumulator; a pool settles lazily as
 `weight × Δaccumulator`, so checkpoints and user actions cost the same with 3 or 60 pools (tested).
@@ -103,10 +108,21 @@ prospectively. New pools and re-enabled pools start at the current accumulator.
 * Withdrawals: immediate, no cooldown. Hamster Bite: 15% of the gross assets backing the burned shares;
   85% to the withdrawer, 14% retained in the farm (raising assets per share for everyone remaining,
   including a partial withdrawer's own remaining shares), 1% to the Treasury. If no shares remain, the
-  full 15% goes to the Treasury.
-* Rewards: MasterChef-style `accRewardPerShare`. Before any share change the farm pulls the pool's
-  accrual from the controller; if the farm is empty the controller forfeits that accrual (never minted)
-  so a later depositor cannot inherit it. `claim(to)` is independent of principal.
+  full 15% goes to the Treasury together with any residual the virtual offset left in the reserve, so
+  the farm restarts empty and nothing is stranded.
+* Treasury payment: pushed with a bounded gas stipend (`TREASURY_PUSH_GAS`, 100k). If the Treasury
+  cannot receive (reverts, has no `receive`, burns the stipend, or the token refuses it) the amount is
+  credited to `treasuryOwed`, `TreasuryPaymentDeferred` is emitted and the withdrawer is still paid.
+  Anyone can later call `payTreasury()` to deliver the owed amount to the Treasury configured then.
+  No Treasury setting can block withdrawals, even with ownership renounced.
+* Rewards: MasterChef-style `accRewardPerShare` with 512-bit `mulDiv` products (a 1-wei first deposit
+  makes the accumulator enormous; deposits of any size stay usable). Reward debts round up and the
+  accumulator rounds down, so the entitlements of all accounts never sum above `rewardReserve` and
+  every claim pays exactly what `pendingRewards` reports; a claim additionally never reverts on a
+  reserve shortfall (it pays what exists and keeps the rest pending). Before any share change the
+  farm pulls the pool's accrual from the controller; if the farm is empty the controller forfeits
+  that accrual (never minted) so a later depositor cannot inherit it. `claim(to)` is independent of
+  principal.
 * Reentrancy: `nonReentrant` on deposit, withdraw, claim and skim; checks-effects-interactions; the ETH
   farm rejects plain transfers.
 * Owner powers on a farm: pause deposits, skim surplus to Treasury, and (sIMD farm) set the asset once.
@@ -117,8 +133,8 @@ prospectively. New pools and re-enabled pools start at the current accumulator.
 | Role | Powers |
 |---|---|
 | Owner (`Ownable2Step`) | bind token once, activate, add pools, set weights, enable/disable pools, set Treasury, set guardian, pause/unpause emissions, pause farm deposits, skim donated surplus, set the sIMD asset once |
-| Guardian | pause emissions only (defaults to the owner) |
-| Anyone | `checkpoint()`, deposit, withdraw, claim |
+| Guardian | pause emissions only (defaults to the owner; the deploy script moves it to the owner on hand-over) |
+| Anyone | `checkpoint()`, deposit, withdraw, claim, `payTreasury()` |
 | Controller | the only CHEESE minter; mints only to a pool's farm, only what that pool accrued |
 
 The owner cannot mint, cannot move user principal, cannot take accrued rewards, cannot change fees,
@@ -151,7 +167,9 @@ move the Treasury with `setTreasury`. Constructors touch no other contract. The 
    deployment; until it is set, deposits revert with `AssetNotConfigured` and the pool's emission is
    forfeited (never minted) when first pulled. Set it before activation or set the pool weight to 0 until
    then to avoid forfeiting.
-4. Optionally `setTreasury(<treasury>)` and `setGuardian(<guardian contract or key>)`.
+4. Optionally `setTreasury(<treasury>)` and `setGuardian(<guardian contract or key>)`. Use an EOA or
+   a Safe as Treasury: it must accept plain ETH within the 100k stipend and accept CHEESE/sIMD
+   transfers, otherwise its share is deferred to `treasuryOwed` until `payTreasury()` succeeds.
 5. `activate()` — schedules emission from the next full Squeek round. Run
    `forge script script/VerifySqueekchain.s.sol --rpc-url <sepolia>` immediately before; if it fails,
    do not activate and report the discrepancy.
@@ -163,15 +181,20 @@ move the Treasury with `setTreasury`. Constructors touch no other contract. The 
 Per the brief, broadcasting needs one explicit approval naming the deployer, owner, Treasury, contract
 addresses and gas budget. IMD's launch supplies deployer, addresses and the gas ceiling after this work
 is accepted; the owner and Treasury are above. Estimated deployment gas from `forge build --sizes`
-runtime sizes: about 4.9M gas for the five constructors combined (controller 12.4 KB, farms 6.5–6.8 KB,
+runtime sizes: about 5.6M gas for the five constructors combined (controller 15.3 KB, farms 7.2–7.8 KB,
 token 4.5 KB runtime), plus about 0.6M gas for the six after-launch calls.
 
 ## Assumptions and open choices
 
 * Squeekchain's Sepolia release is testnet-only and "in active development". CHEESE pins the proxy
   address (stable across upgrades) and re-verifies the clock constants at activation; a changed ABI
-  would make `checkpoint()` return `false` (no emission, nothing lost) until the owner pauses and the
-  team investigates. The controller cannot be re-pointed; a new release would need a new controller.
+  (different return size or undecodable data) makes `checkpoint()` return `false` (no emission,
+  nothing lost, withdrawals and claims unaffected) until the owner pauses and the team investigates.
+  A reordering that keeps the same size and types cannot be detected on chain. The controller cannot
+  be re-pointed; a new release would need a new controller.
+* Rounding: each account may lose at most 1 wei of CHEESE per share change (debts round up); the dust
+  stays in `rewardReserve`. The 100k Treasury gas stipend and the duplicate-id rejection in
+  `batchSetPoolWeights` are design choices, not values from the brief.
 * Emission accrued to a pool with no stakers is forfeited (never minted) rather than paid to the first
   depositor or the Treasury. This keeps "no retroactive rewards" strict; CHEESE total issuance is at
   most SQK's. Alternative (route to Treasury) noted in `docs/SECURITY.md`.
@@ -186,8 +209,8 @@ token 4.5 KB runtime), plus about 0.6M gas for the six after-launch calls.
 
 | Who | Responsibility |
 |---|---|
-| Owner | after-launch steps above; monitor `CoreUnavailable` / `CoreRegression` events; pause on incident; rotate Treasury/guardian; redistribute the premint |
-| Website / keeper | call `checkpoint()` each Squeek round; show `pendingCheckpoint()`, `getPoolAllocation()`, `pendingRewards()` |
+| Owner | after-launch steps above; monitor `CoreUnavailable` / `CoreRegression` / `TreasuryPaymentDeferred` events; pause on incident; rotate Treasury/guardian; redistribute the premint |
+| Website / keeper | call `checkpoint()` each Squeek round; call `payTreasury()` on a farm whose `treasuryOwed() > 0`; show `pendingCheckpoint()`, `getPoolAllocation()`, `pendingRewards()` |
 | Users | approve then `deposit` (ERC-20 farms) or `deposit{value}` (ETH farm); `withdraw(shares)`; `claim(to)` |
 | Independent reviewer | adversarial review before funds are at risk (see `docs/SECURITY.md`) |
 
@@ -201,8 +224,10 @@ FOUNDRY_FUZZ_SEED=0xdf414340e80273b96b0da0b947078a573285f2d5cb8059314b94cca491a4
 forge script script/VerifySqueekchain.s.sol --rpc-url https://ethereum-sepolia-rpc.publicnode.com
 ```
 
-Results on 2026-11-07 (solc 0.8.26, forge 1.8.3, fuzz seed above): 70 tests, 70 passed, 0 failed,
-including 7 fuzz tests (256 runs each) and 5 invariants (64 runs × depth 32, 0 reverts). The Sepolia
+Results on 2026-11-07 (solc 0.8.26, forge 1.8.3, fuzz seed above): 87 tests, 87 passed, 0 failed,
+including 7 fuzz tests (256 runs each) and 7 invariants (64 runs × depth 32; the handler records any
+unexpected deposit, withdraw or claim revert and an invariant fails on it). Also passed with a random
+seed at 512 fuzz runs and 128 × 64 invariant runs. The Sepolia
 verification script was exercised through equivalent `cast` reads (see
 `docs/SQUEEKCHAIN_VERIFICATION.md`); it has not been run by this job as a `forge script`.
 

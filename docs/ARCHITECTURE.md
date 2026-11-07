@@ -11,7 +11,7 @@
             │  h0, lastHeight, issued()    │
             │  emissionPerPoint, pools[]   │
             └──────┬───────────┬───────────┘
-   mintEmission()  │           │ pullRewards(poolId, hasStakers)   (farm-only, per pool)
+   mintEmission()  │           │ pullRewards(poolId, hasStakers) -> (amount, synced)   (farm-only, per pool)
                    ▼           ▼
             ┌───────────┐   ┌──────────────┬──────────────┬──────────────┐
             │CheeseToken│   │CheeseFarmERC20│ CheeseFarmETH│CheeseFarmSIMD│
@@ -34,9 +34,16 @@
 4. **Settlement.** A pool owes `weight × (emissionPerPoint - pool.lastEmissionPerPoint)`. It is settled
    on weight change, enable/disable, and on `pullRewards`.
 5. **Minting.** `pullRewards` (callable only by the pool's farm) mints the pool's accrual to the farm,
-   or forfeits it when the farm has no shares.
+   or forfeits it when the farm has no shares. It also reports whether the sync succeeded; a deposit
+   reverts (`SyncRequired`) when it did not, so certified-but-unpriced blocks can never be diluted.
 6. **Distribution.** The farm adds the minted CHEESE to `rewardReserve` and `accRewardPerShare`;
-   users claim `shares × acc - debt`.
+   users claim `floor(shares × acc / 1e36) - debt` with `debt = ceil(shares × acc / 1e36)` at the last
+   share change (512-bit `mulDiv`), clamped at zero and at `rewardReserve`.
+
+SqueekCore reads (`state`, `configuration`, `roundPage`) are raw `staticcall`s: the payload must have
+the exact static ABI size (256 / 352 bytes) or, for the dynamic `roundPage`, decode through the
+contract's own external `decode*` helper inside `try/catch`. A revert, a missing contract, a wrong size
+or undecodable data all read as "unavailable" and never revert a user's transaction.
 
 Each step is O(1) in the number of pools and users.
 
@@ -54,9 +61,14 @@ SqueekMining's; `issued()` is byte-for-byte the documented formula and reproduce
 * `assets = shares × (totalAssets + 1) / (totalShares + 1e3)` (floor)
 * Withdraw: `gross = assets(shares)`; `fee = 15%`; `paid = gross - fee`; `retained = 14%`;
   `toTreasury = fee - retained`; `totalAssets -= paid + toTreasury`. If `totalShares` becomes 0,
-  `toTreasury = fee`, `retained = 0`.
-* Invariants: `balance >= totalAssets (+ rewardReserve when the asset is CHEESE)`,
-  `Σ sharesOf == totalShares`, `assets(totalShares) <= totalAssets`.
+  `toTreasury = totalAssets - paid` (the fee plus the residual no share can reach), `retained = 0`,
+  and `totalAssets` ends at 0.
+* Treasury push: `call{gas: 100_000}` (ETH) or a non-reverting `transfer` (tokens); on failure
+  `treasuryOwed += toTreasury` and `payTreasury()` delivers it later. The user's `paid` is pushed with a
+  reverting call, as it is their own address.
+* Invariants: `balance >= totalAssets + treasuryOwed (+ rewardReserve when the asset is CHEESE)`,
+  `Σ sharesOf == totalShares`, `assets(totalShares) <= totalAssets`, `Σ pendingRewards <= rewardReserve
+  + unpulled pool emission`.
 
 ## Storage summary
 
@@ -66,6 +78,6 @@ SqueekMining's; `issued()` is byte-for-byte the documented formula and reproduce
 `activeWeight`, `totalWeight`, `Pool[] _pools`, `mapping(farm => id+1)`.
 
 `CheeseFarm`: `poolId`, `registered`, `depositsPaused`, `totalShares`, `totalAssets`, `rewardReserve`,
-`accRewardPerShare`, `sharesOf`, `_rewardDebt`, `claimedOf`, `_pendingOf`.
+`treasuryOwed`, `accRewardPerShare`, `sharesOf`, `_rewardDebt`, `claimedOf`, `_pendingOf`.
 
 No proxies, no delegatecall, no selfdestruct, no external library linking.

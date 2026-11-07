@@ -31,6 +31,11 @@ contract CheeseFarmETH is CheeseFarm {
         if (!ok) revert NativeTransferFailed(to, amount);
     }
 
+    /// @dev Bounded stipend: a Treasury that reverts, lacks receive() or burns gas cannot block withdrawals.
+    function _tryPush(address to, uint256 amount) internal override returns (bool ok) {
+        (ok,) = payable(to).call{value: amount, gas: TREASURY_PUSH_GAS}("");
+    }
+
     function _assetBalance() internal view override returns (uint256) {
         return address(this).balance;
     }

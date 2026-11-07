@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {DeployCheese} from "../script/Deploy.s.sol";
+import {CheeseEmissionController} from "../src/CheeseEmissionController.sol";
 import {MockSqueekCore} from "./mocks/MockSqueekCore.sol";
 
 /// @notice The deploy script's functions, called directly: launch-order deployment, wiring, hand-over, and
@@ -66,5 +67,10 @@ contract DeployTest is Test {
         vm.stopPrank();
         assertEq(dep.controller.owner(), owner);
         assertEq(dep.simdFarm.owner(), owner);
+        // the deployer keeps no role: the guardian moved with ownership
+        assertEq(dep.controller.guardian(), owner);
+        vm.prank(address(d));
+        vm.expectRevert(abi.encodeWithSelector(CheeseEmissionController.NotGuardianOrOwner.selector, address(d)));
+        dep.controller.pauseEmissions();
     }
 }

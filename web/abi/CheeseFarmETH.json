@@ -73,6 +73,19 @@
   },
   {
     "type": "function",
+    "name": "TREASURY_PUSH_GAS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "VIRTUAL_ASSETS",
     "inputs": [],
     "outputs": [
@@ -318,6 +331,19 @@
   },
   {
     "type": "function",
+    "name": "payTreasury",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "pendingOwner",
     "inputs": [],
     "outputs": [
@@ -521,6 +547,19 @@
   },
   {
     "type": "function",
+    "name": "treasuryOwed",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "withdraw",
     "inputs": [
       {
@@ -692,6 +731,44 @@
   },
   {
     "type": "event",
+    "name": "TreasuryPaid",
+    "inputs": [
+      {
+        "name": "treasury",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "TreasuryPaymentDeferred",
+    "inputs": [
+      {
+        "name": "treasury",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "Withdrawn",
     "inputs": [
       {
@@ -808,6 +885,11 @@
   },
   {
     "type": "error",
+    "name": "NothingOwedToTreasury",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "NothingToSkim",
     "inputs": []
   },
@@ -848,6 +930,11 @@
         "internalType": "address"
       }
     ]
+  },
+  {
+    "type": "error",
+    "name": "SyncRequired",
+    "inputs": []
   },
   {
     "type": "error",

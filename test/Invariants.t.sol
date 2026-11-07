@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {CheeseBase} from "./CheeseBase.t.sol";
+import {CheeseFarm} from "../src/CheeseFarm.sol";
 import {CheeseFarmETH} from "../src/farms/CheeseFarmETH.sol";
 import {CheeseEmissionController} from "../src/CheeseEmissionController.sol";
 import {MockSqueekCore} from "./mocks/MockSqueekCore.sol";
@@ -22,6 +23,10 @@ contract CheeseHandler is Test {
     uint256 public ethOutUsers;
     uint256 public ethOutTreasury;
     uint256 public cheeseClaimed;
+    // User actions must never revert for a reason the design does not name; the invariants assert these.
+    bool public unexpectedDepositRevert;
+    bool public withdrawReverted;
+    bool public claimReverted;
 
     constructor(
         CheeseEmissionController controller_,
@@ -55,7 +60,10 @@ contract CheeseHandler is Test {
         vm.prank(who);
         try farm.deposit{value: amt}() {
             ethIn += amt;
-        } catch {}
+        } catch (bytes memory err) {
+            // ZeroShares (a dust deposit at a high share price) is the only revert the design allows here
+            if (bytes4(err) != CheeseFarm.ZeroShares.selector) unexpectedDepositRevert = true;
+        }
     }
 
     function withdraw(uint256 seed, uint96 fraction) external {
@@ -64,15 +72,24 @@ contract CheeseHandler is Test {
         if (shares == 0) return;
         uint256 tBefore = treasury.balance;
         vm.prank(who);
-        uint256 paid = farm.withdraw(shares);
-        ethOutUsers += paid;
-        ethOutTreasury += treasury.balance - tBefore;
+        try farm.withdraw(shares) returns (uint256 paid) {
+            ethOutUsers += paid;
+            ethOutTreasury += treasury.balance - tBefore;
+        } catch {
+            withdrawReverted = true;
+        }
     }
 
     function claim(uint256 seed) external {
         address who = _actor(seed);
+        uint256 pending = farm.pendingRewards(who);
         vm.prank(who);
-        cheeseClaimed += farm.claim(who);
+        try farm.claim(who) returns (uint256 paid) {
+            cheeseClaimed += paid;
+            if (paid != pending) claimReverted = true; // pays exactly what the view promised
+        } catch {
+            claimReverted = true;
+        }
     }
 
     function advance(uint16 blocks) external {
@@ -113,8 +130,25 @@ contract InvariantTest is CheeseBase {
     }
 
     function invariant_farmBalanceCoversPrincipal() public view {
-        assertEq(address(ethFarm).balance, ethFarm.totalAssets());
+        assertEq(address(ethFarm).balance, ethFarm.totalAssets() + ethFarm.treasuryOwed());
+        assertEq(ethFarm.treasuryOwed(), 0, "an EOA Treasury is always paid directly");
         assertEq(cheese.balanceOf(address(ethFarm)), ethFarm.rewardReserve());
+    }
+
+    function invariant_userActionsNeverRevertUnexpectedly() public view {
+        assertFalse(handler.unexpectedDepositRevert(), "deposit reverted for an undocumented reason");
+        assertFalse(handler.withdrawReverted(), "withdraw reverted");
+        assertFalse(handler.claimReverted(), "claim reverted or paid less than pendingRewards");
+    }
+
+    function invariant_entitlementsNeverExceedReserve() public view {
+        uint256 sum;
+        for (uint256 i; i < handler.actorCount(); ++i) {
+            sum += ethFarm.pendingRewards(handler.actors(i));
+        }
+        // pendingRewards includes the pool's unpulled emission; the reserve plus that bound is never exceeded
+        assertLe(sum, ethFarm.rewardReserve() + controller.previewPoolEmission(ethFarm.poolId()));
+        assertLe(ethFarm.totalShares() == 0 ? 0 : ethFarm.convertToAssets(ethFarm.totalShares()), ethFarm.totalAssets());
     }
 
     function invariant_ethConservation() public view {

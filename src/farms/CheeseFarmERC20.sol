@@ -33,6 +33,10 @@ contract CheeseFarmERC20 is CheeseFarm {
         asset.safeTransfer(to, amount);
     }
 
+    function _tryPush(address to, uint256 amount) internal override returns (bool) {
+        return _tryTransferERC20(asset, to, amount);
+    }
+
     function _assetBalance() internal view override returns (uint256) {
         return asset.balanceOf(address(this));
     }

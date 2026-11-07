@@ -317,6 +317,245 @@
   },
   {
     "type": "function",
+    "name": "decodeCoreConfiguration",
+    "inputs": [
+      {
+        "name": "data",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "tuple",
+        "internalType": "struct ISqueekCore.CoreConfiguration",
+        "components": [
+          {
+            "name": "streamId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "genesisTimestamp",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "roundDuration",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "maxWorkPerRound",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "maxRoundsPerBatch",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "guardian",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "reporter",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "initialWorkPerThousandBlocks",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "targetBlocksPerActiveRound",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "difficultySmoothingRounds",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "blockUnitsPerBlock",
+            "type": "uint96",
+            "internalType": "uint96"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "pure"
+  },
+  {
+    "type": "function",
+    "name": "decodeCoreState",
+    "inputs": [
+      {
+        "name": "data",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "tuple",
+        "internalType": "struct ISqueekCore.CoreState",
+        "components": [
+          {
+            "name": "settledThroughRound",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "cumulativeWork",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "cumulativeBlockUnits",
+            "type": "uint96",
+            "internalType": "uint96"
+          },
+          {
+            "name": "blockHeight",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "blockProgress",
+            "type": "uint96",
+            "internalType": "uint96"
+          },
+          {
+            "name": "workPerThousandBlocks",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "authorizationNonce",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "paused",
+            "type": "bool",
+            "internalType": "bool"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "pure"
+  },
+  {
+    "type": "function",
+    "name": "decodeRoundPage",
+    "inputs": [
+      {
+        "name": "data",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "tuple",
+        "internalType": "struct ISqueekCore.RoundPage",
+        "components": [
+          {
+            "name": "certifiedThroughRound",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "start",
+            "type": "tuple",
+            "internalType": "struct ISqueekCore.LedgerPosition",
+            "components": [
+              {
+                "name": "cumulativeWork",
+                "type": "uint64",
+                "internalType": "uint64"
+              },
+              {
+                "name": "cumulativeBlockUnits",
+                "type": "uint96",
+                "internalType": "uint96"
+              },
+              {
+                "name": "workPerThousandBlocks",
+                "type": "uint32",
+                "internalType": "uint32"
+              }
+            ]
+          },
+          {
+            "name": "end",
+            "type": "tuple",
+            "internalType": "struct ISqueekCore.LedgerPosition",
+            "components": [
+              {
+                "name": "cumulativeWork",
+                "type": "uint64",
+                "internalType": "uint64"
+              },
+              {
+                "name": "cumulativeBlockUnits",
+                "type": "uint96",
+                "internalType": "uint96"
+              },
+              {
+                "name": "workPerThousandBlocks",
+                "type": "uint32",
+                "internalType": "uint32"
+              }
+            ]
+          },
+          {
+            "name": "rounds",
+            "type": "tuple[]",
+            "internalType": "struct ISqueekCore.RoundCheckpoint[]",
+            "components": [
+              {
+                "name": "roundId",
+                "type": "uint64",
+                "internalType": "uint64"
+              },
+              {
+                "name": "cumulativeWork",
+                "type": "uint64",
+                "internalType": "uint64"
+              },
+              {
+                "name": "cumulativeBlockUnits",
+                "type": "uint96",
+                "internalType": "uint96"
+              },
+              {
+                "name": "workPerThousandBlocks",
+                "type": "uint32",
+                "internalType": "uint32"
+              },
+              {
+                "name": "dataHash",
+                "type": "bytes32",
+                "internalType": "bytes32"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "stateMutability": "pure"
+  },
+  {
+    "type": "function",
     "name": "disablePool",
     "inputs": [
       {
@@ -640,6 +879,11 @@
         "name": "amount",
         "type": "uint256",
         "internalType": "uint256"
+      },
+      {
+        "name": "synced",
+        "type": "bool",
+        "internalType": "bool"
       }
     ],
     "stateMutability": "nonpayable"
@@ -1210,6 +1454,17 @@
     "type": "error",
     "name": "AlreadyActivated",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "DuplicatePoolId",
+    "inputs": [
+      {
+        "name": "poolId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
   },
   {
     "type": "error",

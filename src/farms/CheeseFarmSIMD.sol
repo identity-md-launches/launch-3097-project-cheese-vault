@@ -50,6 +50,11 @@ contract CheeseFarmSIMD is CheeseFarm {
         asset.safeTransfer(to, amount);
     }
 
+    function _tryPush(address to, uint256 amount) internal override returns (bool) {
+        if (!_assetConfigured()) return false;
+        return _tryTransferERC20(asset, to, amount);
+    }
+
     function _assetBalance() internal view override returns (uint256) {
         if (!_assetConfigured()) return 0;
         return asset.balanceOf(address(this));

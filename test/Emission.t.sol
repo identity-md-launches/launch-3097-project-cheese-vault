@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {CheeseBase} from "./CheeseBase.t.sol";
 import {CheeseEmissionController} from "../src/CheeseEmissionController.sol";
+import {ISqueekCore} from "../src/interfaces/ISqueekCore.sol";
 import {SqueekIssuance} from "../src/libraries/SqueekIssuance.sol";
 
 /// @notice Exact SQK emission matching, halving boundaries, supply cap, no double minting, delayed and zero
@@ -239,6 +240,88 @@ contract EmissionTest is CheeseBase {
         assertEq(emitted, issued(20), "catches up once Core is back");
     }
 
+    function test_undecodableCoreStateIsUnavailableNotARevert() public {
+        activateWithHistory(0);
+        depositEth(alice, 1 ether);
+        advanceBlocks(10);
+        controller.checkpoint();
+        advanceBlocks(10);
+        // a proxy upgrade that changes the CoreState layout: wrong-sized return data
+        vm.mockCall(address(core), abi.encodeCall(ISqueekCore.state, ()), abi.encode(uint256(1)));
+        (bool ok, uint256 emitted) = controller.checkpoint();
+        assertFalse(ok);
+        assertEq(emitted, 0);
+        (bool readable,,) = controller.pendingCheckpoint();
+        assertFalse(readable);
+        assertEq(ethFarm.pendingRewards(alice), (issued(10) * 200) / 1000, "views keep working");
+        // withdrawals and claims go through while Core is undecodable, without anyone pausing
+        uint256 half = ethFarm.sharesOf(alice) / 2;
+        vm.prank(alice);
+        assertGt(ethFarm.withdraw(half), 0);
+        vm.prank(alice);
+        assertEq(ethFarm.claim(alice), (issued(10) * 200) / 1000);
+        vm.prank(bob);
+        vm.expectRevert(); // deposits wait for a successful sync
+        ethFarm.deposit{value: 1 ether}();
+        // right-sized but invalid data (a bool field outside 0/1) is also unavailable
+        bytes memory garbage = new bytes(8 * 32);
+        garbage[8 * 32 - 1] = 0x02;
+        vm.mockCall(address(core), abi.encodeCall(ISqueekCore.state, ()), garbage);
+        (ok,) = controller.checkpoint();
+        assertFalse(ok);
+        vm.clearMockedCalls();
+        (ok, emitted) = controller.checkpoint();
+        assertTrue(ok);
+        assertEq(emitted, issued(20) - issued(10), "catches up once the layout is readable again");
+    }
+
+    function test_coreWithoutCodeIsUnavailableNotARevert() public {
+        activateWithHistory(0);
+        depositEth(alice, 1 ether);
+        advanceBlocks(5);
+        bytes memory code = address(core).code;
+        vm.etch(address(core), "");
+        (bool ok,) = controller.checkpoint();
+        assertFalse(ok);
+        (bool readable,,) = controller.pendingCheckpoint();
+        assertFalse(readable);
+        withdrawAll(ethFarm, alice);
+        vm.etch(address(core), code);
+        (ok,) = controller.checkpoint();
+        assertTrue(ok);
+        assertEq(controller.cumulativeEmission(), issued(5));
+    }
+
+    function test_undecodableRoundPageDelaysAnchorWithoutRevert() public {
+        vm.prank(owner);
+        controller.activate();
+        uint64 start = controller.startRound();
+        core.settle(start - 1, 7, 0);
+        vm.mockCall(
+            address(core), abi.encodeCall(ISqueekCore.roundPage, (start - 1, start - 1, 0)), abi.encode(uint256(1))
+        );
+        (bool ok,) = controller.checkpoint();
+        assertFalse(ok);
+        assertFalse(controller.startCaptured());
+        (bool readable,,) = controller.pendingCheckpoint();
+        assertFalse(readable);
+        vm.clearMockedCalls();
+        (ok,) = controller.checkpoint();
+        assertTrue(ok);
+        assertEq(controller.startHeight(), 7);
+    }
+
+    function test_activateTreatsUndecodableConfigurationAsUnavailable() public {
+        vm.mockCall(address(core), abi.encodeCall(ISqueekCore.configuration, ()), abi.encode(uint256(600)));
+        vm.prank(owner);
+        vm.expectRevert(CheeseEmissionController.SqueekCoreUnavailable.selector);
+        controller.activate();
+        vm.clearMockedCalls();
+        vm.prank(owner);
+        controller.activate();
+        assertTrue(controller.activated());
+    }
+
     function test_pendingCheckpointPreview() public {
         activateWithHistory(5);
         advanceBlocks(33);
@@ -272,6 +355,40 @@ contract EmissionTest is CheeseBase {
         controller.unpauseEmissions();
         controller.checkpoint();
         assertEq(controller.cumulativeEmission(), issued(20), "schedule still matches SQK after unpause");
+    }
+
+    function test_pausePricesBlocksCertifiedBeforeItForThoseStakedThen() public {
+        activateWithHistory(0);
+        depositEth(alice, 10 ether);
+        advanceBlocks(1000); // certified while alice is the sole staker, not yet checkpointed
+        vm.prank(owner);
+        controller.pauseEmissions();
+        uint256 poolShare = (issued(1000) * 200) / 1000;
+        assertEq(controller.cumulativeEmission(), issued(1000), "pause checkpointed first");
+        assertEq(ethFarm.pendingRewards(alice), poolShare, "visible during the pause");
+        withdrawAll(ethFarm, alice);
+        vm.prank(alice);
+        assertEq(ethFarm.claim(alice), poolShare, "paid to the staker who earned it");
+        vm.prank(owner);
+        controller.unpauseEmissions();
+        depositEth(bob, 1 ether);
+        assertEq(controller.forfeitedEmission(), 0, "nothing earned before the pause was forfeited");
+        assertEq(ethFarm.pendingRewards(bob), 0);
+    }
+
+    function test_pauseStillWorksWhenCoreIsUnavailable() public {
+        activateWithHistory(0);
+        advanceBlocks(10);
+        core.setUnavailable(true);
+        vm.prank(owner);
+        controller.pauseEmissions(); // best-effort sync; the pause itself must never be blocked
+        assertTrue(controller.emissionsPaused());
+        assertEq(controller.cumulativeEmission(), 0);
+        core.setUnavailable(false);
+        vm.prank(owner);
+        controller.unpauseEmissions();
+        controller.checkpoint();
+        assertEq(controller.cumulativeEmission(), issued(10));
     }
 
     function test_guardianCanPauseOnlyOwnerUnpauses() public {

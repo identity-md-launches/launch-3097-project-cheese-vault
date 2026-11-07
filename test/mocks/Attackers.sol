@@ -44,9 +44,28 @@ contract ReentrantWithdrawer {
     }
 }
 
-/// @notice Refuses ETH, to show a blocked Treasury cannot trap a withdrawal (treasury payout is pushed first).
+/// @notice Refuses ETH, to show a Treasury that reverts cannot block a withdrawal (its share is deferred).
 contract RejectsETH {
     receive() external payable {
         revert("no");
+    }
+}
+
+/// @notice Burns every unit of gas it is given, to show a Treasury that exhausts the stipend cannot block
+///         a withdrawal either.
+contract BurnsGas {
+    uint256 public sink;
+
+    receive() external payable {
+        while (true) {
+            sink++;
+        }
+    }
+}
+
+/// @notice Has no receive or fallback at all (an accidental Treasury misconfiguration).
+contract NoReceive {
+    function ping() external pure returns (bool) {
+        return true;
     }
 }

@@ -14,7 +14,7 @@ interface ICheeseEmissionController {
     function treasury() external view returns (address);
     function token() external view returns (address);
     function poolIdOf(address farm) external view returns (uint256);
-    function pullRewards(uint256 poolId, bool hasStakers) external returns (uint256 amount);
+    function pullRewards(uint256 poolId, bool hasStakers) external returns (uint256 amount, bool synced);
     function checkpoint() external returns (bool synced, uint256 emitted);
     function emissionsPaused() external view returns (bool);
     function previewPoolEmission(uint256 poolId) external view returns (uint256);

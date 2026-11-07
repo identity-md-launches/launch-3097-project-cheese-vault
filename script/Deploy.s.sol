@@ -68,8 +68,10 @@ contract DeployCheese is Script {
         if (cfg.activate) d.controller.activate();
     }
 
-    /// @notice Hands ownership of every contract to the final owner (two-step; the owner must accept).
+    /// @notice Hands ownership of every contract to the final owner (two-step; the owner must accept). The
+    ///         guardian role defaults to the constructor's owner (the deployer here), so it is moved too.
     function handOver(Deployment memory d, address owner) public {
+        d.controller.setGuardian(owner);
         d.controller.transferOwnership(owner);
         d.cheeseFarm.transferOwnership(owner);
         d.ethFarm.transferOwnership(owner);
