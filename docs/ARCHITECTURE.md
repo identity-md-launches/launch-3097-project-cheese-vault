@@ -40,10 +40,14 @@
    users claim `floor(shares × acc / 1e36) - debt` with `debt = ceil(shares × acc / 1e36)` at the last
    share change (512-bit `mulDiv`), clamped at zero and at `rewardReserve`.
 
-SqueekCore reads (`state`, `configuration`, `roundPage`) are raw `staticcall`s: the payload must have
-the exact static ABI size (256 / 352 bytes) or, for the dynamic `roundPage`, decode through the
-contract's own external `decode*` helper inside `try/catch`. A revert, a missing contract, a wrong size
-or undecodable data all read as "unavailable" and never revert a user's transaction.
+SqueekCore reads (`state`, `configuration`, `roundPage`) are raw `staticcall`s made with no output
+buffer (`_boundedStaticcall`): `returndatasize()` is checked first and the payload is copied only if
+it is within bound (exactly 256 / 352 bytes for the static structs, at most 4 KiB for the dynamic
+`roundPage`), then decoded through the contract's own external `decode*` helper inside `try/catch`.
+A revert, a missing contract, a wrong or oversized size, or undecodable data all read as "unavailable"
+and never revert a user's transaction. The size check before the copy matters: Solidity's high-level
+`staticcall` copies the whole return data with the 1/64 of gas the caller kept, so a Core that burned
+the forwarded gas and returned megabytes would otherwise out-of-gas every withdraw, claim and pause.
 
 Each step is O(1) in the number of pools and users.
 

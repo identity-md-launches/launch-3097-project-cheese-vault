@@ -78,8 +78,11 @@ compiled constant. No address, ABI function or emission parameter was invented.
   `CoreRegression`, changes nothing, and the next successful call catches up. SqueekCore is read
   through raw `staticcall`s whose payloads must have the exact ABI size and decode (via the
   `decode*` helpers), because Solidity's `try/catch` would otherwise revert in the user's
-  transaction. Allocation changes and deposits require a successful sync (deposits revert with
-  `SyncRequired`); withdrawals and claims never do.
+  transaction. The return data is size-checked (`returndatasize()`) before it is copied, with a 4 KiB
+  bound on the dynamic `roundPage`, so a Core that burns the forwarded gas and returns megabytes is
+  "unavailable" (reason `OversizedReturnData`) rather than an out-of-gas on every withdrawal.
+  Allocation changes and deposits require a successful sync (deposits revert with `SyncRequired`);
+  withdrawals and claims never do.
 * Pause (`pauseEmissions`, owner or guardian; `unpauseEmissions`, owner only): the pause first prices
   the blocks certified before it (best effort), so they belong to whoever was staked then. While
   paused no emission is priced, farms refuse deposits, allocation changes revert; withdrawals and
@@ -137,8 +140,14 @@ prospectively. New pools and re-enabled pools start at the current accumulator.
 | Anyone | `checkpoint()`, deposit, withdraw, claim, `payTreasury()` |
 | Controller | the only CHEESE minter; mints only to a pool's farm, only what that pool accrued |
 
-The owner cannot mint, cannot move user principal, cannot take accrued rewards, cannot change fees,
-and cannot rewrite the schedule. Every state change emits an event.
+The owner cannot mint directly, cannot move user principal, cannot take accrued rewards, cannot
+change fees, and cannot rewrite the schedule. The owner *can* direct future emission: `addPool`
+accepts any contract that answers `emissionController()` with the controller and `registered()` with
+false, and weights can be moved to it (prospectively only, bounded by the SQK schedule and the
+mining allowance, never touching principal or rewards already accrued). An owner-controlled pool is
+therefore a way to collect future emission, which is exactly the "add pools, adjust future
+allocation" power the brief grants; a multisig or timelock owner is the mitigation. Every state
+change emits an event.
 
 ## Deployment parameters (IMD launch, Sepolia)
 
@@ -166,7 +175,11 @@ move the Treasury with `setTreasury`. Constructors touch no other contract. The 
 3. `CheeseFarmSIMD.setAsset(<sIMD token>)` — once. The sIMD Sepolia address comes from the IMD sIMD
    deployment; until it is set, deposits revert with `AssetNotConfigured` and the pool's emission is
    forfeited (never minted) when first pulled. Set it before activation or set the pool weight to 0 until
-   then to avoid forfeiting.
+   then to avoid forfeiting. **sIMD must be a static-balance (non-rebasing) ERC-20**: the farm counts
+   principal from amounts received, so a token whose balances rebase would leave the last withdrawers
+   unpaid (negative rebase) or expose depositors' yield to `skimSurplus` (positive rebase). Verify
+   this against the real sIMD before calling; the setter is write-once. If sIMD rebases, do not set
+   it: the farm would need balance-based or wrapper accounting, which is a scope decision.
 4. Optionally `setTreasury(<treasury>)` and `setGuardian(<guardian contract or key>)`. Use an EOA or
    a Safe as Treasury: it must accept plain ETH within the 100k stipend and accept CHEESE/sIMD
    transfers, otherwise its share is deferred to `treasuryOwed` until `payTreasury()` succeeds.
@@ -224,10 +237,11 @@ FOUNDRY_FUZZ_SEED=0xdf414340e80273b96b0da0b947078a573285f2d5cb8059314b94cca491a4
 forge script script/VerifySqueekchain.s.sol --rpc-url https://ethereum-sepolia-rpc.publicnode.com
 ```
 
-Results on 2026-11-07 (solc 0.8.26, forge 1.8.3, fuzz seed above): 87 tests, 87 passed, 0 failed,
-including 7 fuzz tests (256 runs each) and 7 invariants (64 runs × depth 32; the handler records any
-unexpected deposit, withdraw or claim revert and an invariant fails on it). Also passed with a random
-seed at 512 fuzz runs and 128 × 64 invariant runs. The Sepolia
+Results on 2026-11-07, revision 2 (solc 0.8.26, forge 1.8.3, fuzz seed above): 91 tests, 91 passed,
+0 failed, including 7 fuzz tests (256 runs each) and 7 invariants (64 runs × depth 32; the handler
+records any unexpected deposit, withdraw or claim revert, or a claim that pays other than
+`pendingRewards` promised, and an invariant fails on it). Also passed with a random seed at 512 fuzz
+runs and 128 × 64 invariant runs, and the independent reviewer's return-bomb proof passes. The Sepolia
 verification script was exercised through equivalent `cast` reads (see
 `docs/SQUEEKCHAIN_VERIFICATION.md`); it has not been run by this job as a `forge script`.
 

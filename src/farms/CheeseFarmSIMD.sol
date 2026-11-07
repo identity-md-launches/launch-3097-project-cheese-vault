@@ -22,6 +22,11 @@ contract CheeseFarmSIMD is CheeseFarm {
     constructor(address owner_, address controller_) CheeseFarm(owner_, controller_) {}
 
     /// @notice Sets the sIMD token once. The address comes from the IMD sIMD deployment on Sepolia.
+    /// @dev The farm tracks principal from the amounts it receives (`totalAssets`), never from its balance,
+    ///      so the asset MUST be a static-balance ERC-20. A rebasing token breaks the accounting: a negative
+    ///      rebase leaves the last withdrawers unpaid, and a positive one shows as `surplus()` that
+    ///      `skimSurplus()` would move to the Treasury. Fee-on-transfer is handled (received amounts are
+    ///      measured). Verify the real sIMD does not rebase before calling; this cannot be undone.
     function setAsset(address asset_) external onlyOwner {
         if (address(asset) != address(0)) revert AssetAlreadySet();
         if (asset_ == address(0)) revert ZeroAddress();

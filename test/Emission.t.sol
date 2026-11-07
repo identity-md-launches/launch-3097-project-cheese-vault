@@ -391,6 +391,88 @@ contract EmissionTest is CheeseBase {
         assertEq(controller.cumulativeEmission(), issued(10));
     }
 
+    /// @dev A SqueekCore whose every call expands memory to 2 MiB, burns the forwarded gas down to ~65k and
+    ///      returns the 2 MiB: PUSH1 0 PUSH3 0x1FFFE0 MSTORE | JUMPDEST GAS PUSH3 0xFFFF LT PUSH1 7 JUMPI |
+    ///      PUSH3 0x200000 PUSH1 0 RETURN. A caller that copied the payload with its remaining 1/64 of gas
+    ///      would run out of gas however much the transaction supplied.
+    bytes internal constant RETURN_BOMB = hex"6000621fffe0525b5a6200ffff10600757622000006000f3";
+
+    function test_returnBombCoreDoesNotBlockExitsOrPause() public {
+        activateWithHistory(0);
+        depositEth(alice, 1 ether);
+        advanceBlocks(10);
+        controller.checkpoint();
+        uint256 earned = ethFarm.pendingRewards(alice);
+        assertGt(earned, 0);
+        bytes memory code = address(core).code;
+        vm.etch(address(core), RETURN_BOMB);
+
+        // the read is reported as unavailable with the payload size, not copied
+        vm.expectEmit(address(controller));
+        emit CheeseEmissionController.CoreUnavailable(abi.encodeWithSelector(
+                CheeseEmissionController.OversizedReturnData.selector, 0x200000, 8 * 32
+            ));
+        (bool ok,) = controller.checkpoint{gas: 30_000_000}();
+        assertFalse(ok);
+        (bool readable,,) = controller.pendingCheckpoint{gas: 30_000_000}();
+        assertFalse(readable);
+        // (every call into the bomb is capped so the test's own gas budget is not burned 63/64 at a time)
+        assertEq(ethFarm.pendingRewards{gas: 30_000_000}(alice), earned, "views keep working");
+
+        // withdraw, claim and the emergency pause all succeed within a normal gas limit
+        uint256 shares = ethFarm.sharesOf(alice);
+        vm.prank(alice);
+        assertEq(ethFarm.withdraw{gas: 30_000_000}(shares), 0.85 ether, "85% paid");
+        vm.prank(alice);
+        assertEq(ethFarm.claim{gas: 30_000_000}(alice), earned, "accrued rewards claimable");
+        vm.prank(owner);
+        controller.pauseEmissions{gas: 30_000_000}();
+        assertTrue(controller.emissionsPaused());
+
+        // a healthy Core again: nothing was lost
+        vm.etch(address(core), code);
+        vm.prank(owner);
+        controller.unpauseEmissions();
+        advanceBlocks(5);
+        (ok,) = controller.checkpoint();
+        assertTrue(ok);
+        assertEq(controller.cumulativeEmission(), issued(15));
+    }
+
+    function test_oversizedConfigurationIsUnavailableAtActivation() public {
+        // the configuration read is bounded to its exact size too: one extra byte is "unavailable"
+        vm.mockCall(address(core), abi.encodeCall(ISqueekCore.configuration, ()), new bytes(11 * 32 + 1));
+        vm.prank(owner);
+        vm.expectRevert(CheeseEmissionController.SqueekCoreUnavailable.selector);
+        controller.activate();
+        vm.clearMockedCalls();
+        vm.etch(address(core), RETURN_BOMB);
+        vm.prank(owner);
+        vm.expectRevert(CheeseEmissionController.SqueekCoreUnavailable.selector);
+        controller.activate{gas: 30_000_000}();
+    }
+
+    function test_oversizedRoundPageDelaysAnchorWithoutRevert() public {
+        vm.prank(owner);
+        controller.activate();
+        uint64 start = controller.startRound();
+        core.settle(start - 1, 7, 0);
+        // a page just above the bound is unavailable; one at the bound that fails to decode is too
+        bytes memory huge = new bytes(4096 + 1);
+        vm.mockCall(address(core), abi.encodeCall(ISqueekCore.roundPage, (start - 1, start - 1, 0)), huge);
+        vm.expectEmit(address(controller));
+        emit CheeseEmissionController.CoreUnavailable(abi.encodeWithSelector(
+                CheeseEmissionController.OversizedReturnData.selector, 4097, 4096
+            ));
+        (bool ok,) = controller.checkpoint();
+        assertFalse(ok);
+        assertFalse(controller.startCaptured());
+        vm.clearMockedCalls();
+        (ok,) = controller.checkpoint();
+        assertTrue(ok);
+        assertEq(controller.startHeight(), 7);
+    }
+
     function test_guardianCanPauseOnlyOwnerUnpauses() public {
         vm.prank(owner);
         controller.setGuardian(carol);

@@ -42,6 +42,11 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
     /// @dev Exact ABI sizes of SqueekCore's static return structs; any other size is treated as unavailable.
     uint256 internal constant CORE_STATE_BYTES = 8 * 32;
     uint256 internal constant CORE_CONFIGURATION_BYTES = 11 * 32;
+    /// @dev Largest roundPage(r, r, 0) payload accepted. The page for a single round is 320 bytes with no
+    ///      records and 480 with one; 4 KiB leaves room for a dozen records and costs a few hundred gas to
+    ///      copy. Return data is never copied before its size has been checked against these bounds, so a
+    ///      Core that returns megabytes cannot make the caller run out of gas (see _boundedStaticcall).
+    uint256 internal constant CORE_ROUND_PAGE_MAX_BYTES = 4096;
 
     uint256 public constant MINING_ALLOWANCE = SqueekIssuance.ALLOWANCE;
     uint256 public constant LAUNCH_BONUS = SqueekIssuance.LAUNCH_BONUS;
@@ -136,6 +141,8 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
     error LengthMismatch();
     error EmptyBatch();
     error DuplicatePoolId(uint256 poolId);
+    /// @dev Never thrown; encoded as the CoreUnavailable reason when SqueekCore returns more than the bound.
+    error OversizedReturnData(uint256 size, uint256 maxSize);
 
     // ------------------------------------------------------------------------------------------------
     // Construction
@@ -363,11 +370,12 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
         Pool storage pool = _pool(poolId);
         total = pool.accrued;
         if (!pool.enabled) return total;
-        total += (uint256(pool.weight) * (emissionPerPoint - pool.lastEmissionPerPoint)) / PRECISION;
+        // Computed exactly as a pull would: the unsynced checkpoint first raises the per-point accumulator
+        // (_sync), then the pool's share floors once (_settle). Two separate floors could read 1 wei low.
+        uint256 deltaPerPoint = emissionPerPoint - pool.lastEmissionPerPoint;
         (bool readable,, uint256 unsynced) = this.pendingCheckpoint();
-        if (readable && unsynced != 0) {
-            total += (uint256(pool.weight) * ((unsynced * PRECISION) / TOTAL_POINTS)) / PRECISION;
-        }
+        if (readable) deltaPerPoint += (unsynced * PRECISION) / TOTAL_POINTS;
+        total += (uint256(pool.weight) * deltaPerPoint) / PRECISION;
     }
 
     /// @notice Points split: enabled pools / disabled pools / the Future Pool Reserve (never minted).
@@ -480,12 +488,40 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
         return emission > remaining ? remaining : emission;
     }
 
+    /// @dev Static call to SqueekCore that copies return data only after checking its size. Solidity's
+    ///      `addr.staticcall(...)` copies the whole payload first, and the copy is paid by the caller out of
+    ///      the 1/64 of gas it kept (EIP-150): a Core that burns the forwarded gas and then returns megabytes
+    ///      would make every read, and with it every withdraw, claim and the emergency pause, run out of gas.
+    ///      Here nothing is written during the call and `returndatasize()` is checked against `maxBytes`
+    ///      before any copy, so an oversized payload (success or revert) costs nothing and reads as
+    ///      unavailable with an `OversizedReturnData` reason.
+    function _boundedStaticcall(bytes memory input, uint256 maxBytes)
+        internal
+        view
+        returns (bool success, bytes memory data)
+    {
+        address target = address(squeekCore);
+        uint256 size;
+        assembly ("memory-safe") {
+            success := staticcall(gas(), target, add(input, 0x20), mload(input), 0, 0)
+            size := returndatasize()
+        }
+        if (size > maxBytes) {
+            return (false, abi.encodeWithSelector(OversizedReturnData.selector, size, maxBytes));
+        }
+        data = new bytes(size);
+        assembly ("memory-safe") {
+            returndatacopy(add(data, 0x20), 0, size)
+        }
+    }
+
     /// @dev Reads SqueekCore.state() defensively. Solidity's try/catch does not cover return data that fails
-    ///      to decode or a target without code (both revert in the caller), so the call is a raw staticcall
-    ///      whose payload must have the exact ABI size and decode through `this.decodeCoreState`. Any failure
-    ///      reads as "unavailable" with the raw payload as the reason, and never blocks a user action.
+    ///      to decode or a target without code (both revert in the caller), so the call is a bounded raw
+    ///      staticcall whose payload must have the exact ABI size and decode through `this.decodeCoreState`.
+    ///      Any failure reads as "unavailable" with the raw payload as the reason, and never blocks a user
+    ///      action.
     function _readState() internal view returns (bool ok, ISqueekCore.CoreState memory s, bytes memory reason) {
-        (bool success, bytes memory data) = address(squeekCore).staticcall(abi.encodeCall(ISqueekCore.state, ()));
+        (bool success, bytes memory data) = _boundedStaticcall(abi.encodeCall(ISqueekCore.state, ()), CORE_STATE_BYTES);
         if (!success || data.length != CORE_STATE_BYTES) return (false, s, data);
         try this.decodeCoreState(data) returns (ISqueekCore.CoreState memory decoded) {
             return (true, decoded, "");
@@ -497,7 +533,7 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
     /// @dev Same defensive read for SqueekCore.configuration() (used only by activate()).
     function _readConfiguration() internal view returns (bool ok, ISqueekCore.CoreConfiguration memory c) {
         (bool success, bytes memory data) =
-            address(squeekCore).staticcall(abi.encodeCall(ISqueekCore.configuration, ()));
+            _boundedStaticcall(abi.encodeCall(ISqueekCore.configuration, ()), CORE_CONFIGURATION_BYTES);
         if (!success || data.length != CORE_CONFIGURATION_BYTES) return (false, c);
         try this.decodeCoreConfiguration(data) returns (ISqueekCore.CoreConfiguration memory decoded) {
             return (true, decoded);
@@ -507,10 +543,11 @@ contract CheeseEmissionController is Ownable2Step, ICheeseEmissionController {
     }
 
     /// @dev Completed Squeek height at the end of `round`, from roundPage(round, round, 0).end, read the same
-    ///      defensive way (the page is dynamically encoded, so only the decode helper can validate it).
+    ///      defensive way (the page is dynamically encoded, so its size is only bounded here and the decode
+    ///      helper validates the layout).
     function _readHeightAtRound(uint64 round) internal view returns (bool ok, uint64 height, bytes memory reason) {
         (bool success, bytes memory data) =
-            address(squeekCore).staticcall(abi.encodeCall(ISqueekCore.roundPage, (round, round, 0)));
+            _boundedStaticcall(abi.encodeCall(ISqueekCore.roundPage, (round, round, 0)), CORE_ROUND_PAGE_MAX_BYTES);
         if (!success || data.length == 0) return (false, 0, data);
         try this.decodeRoundPage(data) returns (ISqueekCore.RoundPage memory page) {
             return (true, uint64(page.end.cumulativeBlockUnits / BLOCK_UNITS_PER_BLOCK), "");

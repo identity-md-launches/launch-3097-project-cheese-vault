@@ -219,6 +219,33 @@ contract FarmTest is CheeseBase {
         assertEq(ethFarm.rewardReserve(), cheese.balanceOf(address(ethFarm)));
     }
 
+    /// @dev The view must floor once, as the pull does, or it reads 1 wei below what claim pays whenever both
+    ///      settled-but-unpulled and unsynced emission are non-zero (reviewer scenario and ordinary sizes).
+    function test_pendingRewardsMatchesClaimExactlyWithUnsyncedBlocks() public {
+        activateWithHistory(0);
+        address dusty = address(0xA11CF);
+        vm.deal(dusty, 1 ether);
+        vm.prank(dusty);
+        ethFarm.deposit{value: 7314}();
+        advanceBlocks(4989);
+        controller.checkpoint();
+        advanceBlocks(41);
+        uint256 promised = ethFarm.pendingRewards(dusty);
+        vm.prank(dusty);
+        assertEq(ethFarm.claim(dusty), promised, "claim pays exactly what the view promised");
+
+        withdrawAll(ethFarm, dusty);
+        depositEth(alice, 10 ether);
+        for (uint64 i = 1; i < 60; ++i) {
+            advanceBlocks(30 + i);
+            controller.checkpoint();
+            advanceBlocks(41 + (i % 7));
+            promised = ethFarm.pendingRewards(alice);
+            vm.prank(alice);
+            assertEq(ethFarm.claim(alice), promised, "view and claim agree every cycle");
+        }
+    }
+
     function test_newDepositorGetsNothingFromEarlierBlocks() public {
         activateWithHistory(0);
         depositEth(alice, 1 ether);

@@ -29,12 +29,26 @@ only from `msg.sender`, no initializers/upgrades, no uninitialized storage point
 | 11 | low | When the last real shares left, the part of retained fees attributable to the virtual shares stayed in `totalAssets` with no shares to reach it. | With `totalShares == 0` the whole remaining reserve goes to the Treasury with the fee; the farm restarts at the initial price. | `test_emptyFarmSweepsResidualRetainedFeeToTreasury`, `test_lastDepositorWithdrawalSendsFull15ToTreasury` |
 | 12 | low | The deploy script's hand-over left the deployer as guardian. | `handOver` calls `setGuardian(owner)` first. | `test_wireAndHandOver` |
 
+## Fixed after independent review (revision 2)
+
+| # | Severity | Finding | Fix | Test |
+|---|---|---|---|---|
+| 13 | medium | The three SqueekCore reads used Solidity's `addr.staticcall(...)`, which copies the callee's whole return data with the 1/64 of gas the caller keeps (EIP-150). A Core upgrade that burned the forwarded gas and returned 2 MiB made every withdraw, claim and the emergency pause run out of gas, locking all principal. | `_boundedStaticcall` calls with no output buffer, checks `returndatasize()` against the expected size (exact for `state`/`configuration`, 4 KiB for `roundPage`) and only then copies. An oversized payload reads as unavailable with an `OversizedReturnData(size, max)` reason. | `test_returnBombCoreDoesNotBlockExitsOrPause`, `test_oversizedRoundPageDelaysAnchorWithoutRevert` |
+| 14 | low | `previewPoolEmission` floored the settled-but-unpulled and the unsynced parts separately, so `pendingRewards` read up to 1 wei below what `claim` paid; the strict handler in `test/Invariants.t.sol` could flag it. | The preview adds the unsynced increment to the per-point delta first and floors once, exactly as `_sync` + `_settle` do. | `test_pendingRewardsMatchesClaimExactlyWithUnsyncedBlocks`, `invariant_userActionsNeverRevertUnexpectedly` |
+| 15 | low | Nothing stated that the sIMD asset must be non-rebasing; the farm counts principal from amounts received, so a rebasing token would strand the last withdrawers (negative) or expose depositors' yield to `skimSurplus` (positive). | Documented at `setAsset`, in the README's after-launch step and in item 6 below. The accounting is unchanged (balance-based accounting for a rebasing asset would be a scope change). | n/a (documentation) |
+| 16 | info | README and this file said "the owner cannot mint"; the owner can register any contract answering `emissionController()`/`registered()` as a pool and route future emission to it. | Wording corrected: the owner cannot mint directly but can direct future emission to any pool it registers (prospective, schedule-bounded, no principal or accrued rewards). | `test_addPoolRejectsFarmOfAnotherController` (what `addPool` checks) |
+
 ## Trust assumptions (by design, requested by the brief)
 
 * **Owner** can reallocate future emission between pools (including to 0), pause emissions (which also
   closes deposits), pause a farm's deposits, change the Treasury, and skim donated surplus to it. The
-  owner cannot mint, change fees, or move principal or accrued rewards. Recommend a multisig or timelock
-  as owner; `Ownable2Step` prevents accidental loss of ownership.
+  owner cannot mint directly, change fees, or move principal or accrued rewards. The owner *can* direct
+  future emission to any contract it registers as a pool (`addPool` only checks that the candidate
+  points back at the controller and is not yet registered), including one it controls, by moving
+  weights to it; this is prospective, bounded by the SQK schedule and the mining allowance, and
+  touches no principal or already accrued rewards. It is the brief's "add pools, adjust future
+  allocation" power, so a multisig or timelock as owner is the mitigation; `Ownable2Step` prevents
+  accidental loss of ownership.
 * **Guardian** can only pause emissions.
 * **Squeekchain** is the sole emission oracle. Its Reporter and admin Timelock control what gets
   certified; a malicious or buggy settlement would mis-price CHEESE in the same way it mis-prices SQK.
@@ -70,13 +84,24 @@ only from `msg.sender`, no initializers/upgrades, no uninitialized storage point
    price resets. A 1-wei first depositor alone in a farm collects that pool's whole emission for as long
    as nobody else deposits; that is the intended "whoever is staked earns" rule, not a loss to others.
 6. **Owner-set addresses are checked only for non-zero** (Treasury, guardian) or for code (sIMD asset).
-   A wrong sIMD address cannot be corrected (write-once); verify before calling.
+   A wrong sIMD address cannot be corrected (write-once); verify before calling. **sIMD must be a
+   static-balance (non-rebasing) ERC-20.** The farms track principal in `totalAssets` from the amounts
+   they receive, never from `balanceOf`, which is what defeats donation inflation but assumes balances
+   only change through the farm's own transfers. With a negatively rebasing token the farm would
+   overstate its holdings, pay early withdrawers from later depositors' tokens and fail the last
+   withdrawals; with a positively rebasing one the growth shows as `surplus()` and `skimSurplus()` would
+   send depositors' yield to the Treasury. Fee-on-transfer tokens are fine (received amounts are
+   measured). If the real sIMD rebases, do not call `setAsset`; a balance-based or wrapper farm is a
+   scope decision for the requester.
 7. **Gas of `claim`/`deposit`.** Each user action may perform the checkpoint and mint (≈330k gas worst
    case in tests). Acceptable on Sepolia; a keeper calling `checkpoint()` each round keeps user actions
    cheaper.
 8. **Squeekchain ABI change.** The proxies may be upgraded by their admin Timelock. A breaking change
-   (another return size, undecodable data, code removed) makes `checkpoint()` return `false` and leaves
-   withdrawals, claims and views working; deposits wait. A change that keeps the same size and field
+   (another return size, undecodable data, code removed, a payload of any size after burning the
+   forwarded gas) makes `checkpoint()` return `false` and leaves withdrawals, claims, views and the
+   pause working (tested with reverting, gas-burning and 2 MiB return-bomb Cores); deposits wait. A
+   Core that consumes all forwarded gas raises the gas a user action costs (up to 63/64 of what the user
+   supplies) but does not block it. A change that keeps the same size and field
    types but another meaning cannot be detected on chain and would mis-price emission until the owner
    pauses. In both cases a new controller would be required. The controller's `squeekCore` is immutable
    by design (no re-pointing attack surface).
@@ -93,7 +118,7 @@ only from `msg.sender`, no initializers/upgrades, no uninitialized storage point
 - [x] Oracle: not a price oracle; Squeekchain state read live, regression and unavailability handled
 - [x] Integer math: multiply before divide; 512-bit `Math.mulDiv` on every share × accumulator product; floors analysed, debts round up
 - [x] SafeERC20 everywhere; ETH via `call` with revert on failure for the user's payout, bounded non-reverting push plus pull fallback for the Treasury
-- [x] External dependency: SqueekCore read defensively (raw `staticcall`, size check, guarded decode); no user action depends on it
+- [x] External dependency: SqueekCore read defensively (raw `staticcall` with `returndatasize()` checked before any copy, exact/bounded size, guarded decode); no user action depends on it
 - [x] Input validation: zero address/amount/shares, weight bounds, batch length, duplicate farm
 - [x] Events on every state change
 - [x] Permissionless maintenance (`checkpoint`)
