@@ -516,42 +516,137 @@ contract AdversarialTest is CheeseBase {
         assertLe(gross, (amtA * shares) / aliceShares + 1, "no more than deposited");
     }
 
+    /// @dev The last withdrawer still receives exactly 85% of gross; the Treasury receives the full 15% plus the
+    ///      residual the virtual offset left unreachable, and the farm restarts at an empty reserve.
     function test_lastWithdrawerPaysFullFifteenPercentToTreasuryAfterFees() public {
         depositEth(alice, 10 ether);
         depositEth(bob, 10 ether);
         withdrawAll(ethFarm, alice); // 14% of alice's stays with bob
         uint256 gross = ethFarm.assetsOf(bob);
         assertGt(gross, 10 ether, "bob gained alice's retained share");
+        uint256 reserveBefore = ethFarm.totalAssets();
         uint256 treasuryBefore = treasury.balance;
         uint256 paid = withdrawAll(ethFarm, bob);
         uint256 fee = (gross * 1500) / 10_000;
-        assertEq(paid, gross - fee);
-        assertEq(treasury.balance - treasuryBefore, fee, "full 15% to treasury");
+        assertEq(paid, gross - fee, "85% of gross to the withdrawer");
+        uint256 toTreasury = treasury.balance - treasuryBefore;
+        assertGe(toTreasury, fee, "at least the full 15% to treasury");
+        assertEq(toTreasury, reserveBefore - paid, "treasury takes the whole remainder");
+        assertLe(toTreasury - fee, 1e3, "residual above the fee is only virtual-offset dust");
         assertEq(ethFarm.totalShares(), 0);
-        assertLe(ethFarm.totalAssets(), 1e3, "only rounding dust left unowned");
-        assertEq(address(ethFarm).balance, ethFarm.totalAssets());
+        assertEq(ethFarm.totalAssets(), 0, "farm restarts empty");
+        assertEq(address(ethFarm).balance, 0);
+    }
+
+    /// @dev After the reset a fresh depositor gets the exact virtual-offset price, inheriting nothing.
+    function test_depositAfterFullExitStartsAtFreshPrice() public {
+        depositEth(alice, 3 ether);
+        depositEth(bob, 7 ether);
+        withdrawAll(ethFarm, alice);
+        withdrawAll(ethFarm, bob);
+        uint256 shares = depositEth(carol, 1 ether);
+        assertEq(shares, 1 ether * 1e3, "same price as the very first deposit");
+        assertLe(ethFarm.assetsOf(carol), 1 ether, "no inherited value");
+        assertApproxEqAbs(ethFarm.assetsOf(carol), 1 ether, 1, "full deposit backed");
     }
 
     // ------------------------------------------------------------------------------------------------
-    // External dependency: malformed SqueekCore data (see .imd-findings.json, low)
+    // External dependency: malformed SqueekCore data
     // ------------------------------------------------------------------------------------------------
 
-    /// @dev The guardian's pause is the emergency path that keeps principal withdrawable when Core's return
-    ///      data cannot be decoded. That the unpaused withdrawal reverts is reported as a finding.
-    function test_malformedCoreDataGuardianPauseRestoresWithdrawals() public {
+    /// @dev Malformed Core return data reads as unavailable: withdrawals and claims go through unpaused,
+    ///      deposits wait, and the guardian can still pause.
+    function test_malformedCoreDataDoesNotBlockExitsButBlocksDeposits() public {
         activateWithHistory(0);
         depositEth(alice, 1 ether);
+        depositEth(bob, 1 ether);
         advanceBlocks(10);
-        vm.prank(alice);
-        uint256 claimedBefore = ethFarm.claim(alice);
+        controller.checkpoint();
         vm.mockCall(address(core), abi.encodeWithSelector(ISqueekCore.state.selector), abi.encode(uint256(1)));
-        vm.prank(owner);
-        controller.pauseEmissions();
+        (bool ok,) = controller.checkpoint();
+        assertFalse(ok, "malformed data is unavailable, not a revert");
+        vm.prank(carol);
+        vm.expectRevert(CheeseFarm.SyncRequired.selector);
+        ethFarm.deposit{value: 1 ether}();
+        vm.prank(alice);
+        uint256 claimed = ethFarm.claim(alice);
+        assertEq(claimed, (issued(10) * 200) / 1000 / 2);
         uint256 balBefore = alice.balance;
         uint256 paid = withdrawAll(ethFarm, alice);
         assertEq(alice.balance - balBefore, paid);
         assertEq(paid, 1 ether - (1 ether * 1500) / 10_000, "85% back");
-        assertGt(claimedBefore, 0);
+        vm.prank(owner);
+        controller.pauseEmissions();
+        assertTrue(controller.emissionsPaused());
+        assertGt(withdrawAll(ethFarm, bob), 0);
+    }
+
+    /// @dev Blocks certified before a pause are priced by the pause itself, so they go to whoever was staked
+    ///      then; blocks certified while paused are caught up after unpausing.
+    function test_pausePricesBlocksCertifiedBeforeIt() public {
+        activateWithHistory(0);
+        depositEth(alice, 1 ether);
+        advanceBlocks(10);
+        vm.prank(owner);
+        controller.pauseEmissions();
+        assertEq(controller.cumulativeEmission(), issued(10), "pre-pause blocks priced at pause");
+        advanceBlocks(5);
+        assertEq(controller.cumulativeEmission(), issued(10), "nothing priced while paused");
+        vm.prank(alice);
+        assertEq(ethFarm.claim(alice), (issued(10) * 200) / 1000, "alice owns the pre-pause blocks");
+        vm.prank(owner);
+        controller.unpauseEmissions();
+        (bool ok, uint256 emitted) = controller.checkpoint();
+        assertTrue(ok);
+        assertEq(emitted, issued(15) - issued(10), "paused blocks caught up exactly");
+    }
+
+    /// @dev A pause while Core is unreadable still succeeds (the sync is best effort).
+    function test_pauseSucceedsWhileCoreUnavailable() public {
+        activateWithHistory(0);
+        depositEth(alice, 1 ether);
+        advanceBlocks(10);
+        core.setUnavailable(true);
+        vm.prank(owner);
+        controller.pauseEmissions();
+        assertTrue(controller.emissionsPaused());
+        assertEq(controller.cumulativeEmission(), 0);
+    }
+
+    /// @dev A Core that burns all forwarded gas (INVALID) still leaves the caller its 1/64: exits and the
+    ///      emergency pause go through within a 30M-gas transaction. (A Core that instead returns a huge
+    ///      payload does block them; that is reported in .imd-findings.json, not asserted here.)
+    function test_gasBurningCoreDoesNotBlockExitsOrPause() public {
+        activateWithHistory(0);
+        depositEth(alice, 1 ether);
+        depositEth(bob, 1 ether);
+        advanceBlocks(10);
+        controller.checkpoint();
+        vm.etch(address(core), hex"fe");
+        uint256 shares = ethFarm.sharesOf(alice);
+        vm.prank(alice);
+        uint256 paid = ethFarm.withdraw{gas: 30_000_000}(shares);
+        assertEq(paid, 0.85 ether);
+        vm.prank(bob);
+        assertEq(ethFarm.claim{gas: 30_000_000}(bob), (issued(10) * 200) / 1000 / 2);
+        vm.prank(owner);
+        controller.pauseEmissions{gas: 30_000_000}();
+        assertTrue(controller.emissionsPaused());
+    }
+
+    function test_depositWaitsForCoreRecoveryThenSucceeds() public {
+        activateWithHistory(0);
+        depositEth(alice, 1 ether);
+        advanceBlocks(10);
+        core.setUnavailable(true);
+        vm.prank(bob);
+        vm.expectRevert(CheeseFarm.SyncRequired.selector);
+        ethFarm.deposit{value: 1 ether}();
+        core.setUnavailable(false);
+        depositEth(bob, 1 ether);
+        // the 10 blocks certified during the outage went to alice alone
+        assertEq(ethFarm.pendingRewards(alice), (issued(10) * 200) / 1000);
+        assertEq(ethFarm.pendingRewards(bob), 0);
     }
 
     function test_unavailableCoreDoesNotBlockWithdrawOrClaim() public {

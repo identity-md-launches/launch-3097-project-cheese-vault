@@ -37,6 +37,9 @@ contract SystemHandler is Test {
     bool public sawCompleted;
     bool public emissionRegressed;
     bool public completionReopened;
+    bool public claimReverted;
+    bool public claimMismatch;
+    bool public withdrawReverted;
 
     constructor(
         CheeseEmissionController controller_,
@@ -102,9 +105,12 @@ contract SystemHandler is Test {
         if (shares == 0) return;
         uint256 tBefore = treasury.balance;
         vm.prank(who);
-        uint256 paid = ethFarm.withdraw(shares);
-        ethOutUsers += paid;
-        ethOutTreasury += treasury.balance - tBefore;
+        try ethFarm.withdraw(shares) returns (uint256 paid) {
+            ethOutUsers += paid;
+            ethOutTreasury += treasury.balance - tBefore;
+        } catch {
+            withdrawReverted = true;
+        }
         _track();
     }
 
@@ -114,21 +120,32 @@ contract SystemHandler is Test {
         if (shares == 0) return;
         uint256 tBefore = cheese.balanceOf(treasury);
         vm.prank(who);
-        uint256 paid = cheeseFarm.withdraw(shares);
-        cheeseOutUsers += paid;
-        cheeseOutTreasury += cheese.balanceOf(treasury) - tBefore;
+        try cheeseFarm.withdraw(shares) returns (uint256 paid) {
+            cheeseOutUsers += paid;
+            cheeseOutTreasury += cheese.balanceOf(treasury) - tBefore;
+        } catch {
+            withdrawReverted = true;
+        }
         _track();
     }
 
-    /// @dev A claim that underflows the reward reserve is the reported rounding defect; it is tolerated here
-    ///      (try/catch) so the other invariants keep being explored.
+    /// @dev A claim must never revert (the earlier rounding underflow is fixed) and must pay what pendingRewards
+    ///      promised just before (to within view rounding), with nothing left pending.
     function claim(uint256 seed, bool fromCheeseFarm) external {
         address who = _actor(seed);
         CheeseFarm farm = fromCheeseFarm ? CheeseFarm(address(cheeseFarm)) : CheeseFarm(address(ethFarm));
+        uint256 promised = farm.pendingRewards(who);
+        uint256 balBefore = cheese.balanceOf(who);
         vm.prank(who);
         try farm.claim(who) returns (uint256 amount) {
             rewardsClaimed += amount;
-        } catch {}
+            // The view prices unsynced blocks in a separate floor, so it may differ from the claim by rounding.
+            if (amount > promised + 2 || promised > amount + 2) claimMismatch = true;
+            if (cheese.balanceOf(who) - balBefore != amount) claimMismatch = true;
+            if (farm.pendingRewards(who) != 0) claimMismatch = true;
+        } catch {
+            claimReverted = true;
+        }
         _track();
     }
 
@@ -219,6 +236,20 @@ contract SystemInvariantTest is CheeseBase {
         assertGe(cheese.balanceOf(address(cheeseFarm)), cheeseFarm.totalAssets() + cheeseFarm.rewardReserve());
         assertEq(address(ethFarm).balance, ethFarm.totalAssets());
         assertEq(cheese.balanceOf(address(ethFarm)), ethFarm.rewardReserve());
+        // The Treasury is an EOA, so nothing is ever deferred.
+        assertEq(ethFarm.treasuryOwed(), 0);
+        assertEq(cheeseFarm.treasuryOwed(), 0);
+        // An empty farm holds no principal: the last withdrawer's exit sweeps the residual to the Treasury.
+        if (ethFarm.totalShares() == 0) assertEq(ethFarm.totalAssets(), 0, "empty ETH farm, zero principal");
+        if (cheeseFarm.totalShares() == 0) assertEq(cheeseFarm.totalAssets(), 0, "empty CHEESE farm, zero principal");
+    }
+
+    /// forge-config: default.invariant.runs = 128
+    /// forge-config: default.invariant.depth = 48
+    function invariant_exitsNeverRevert() public view {
+        assertFalse(handler.claimReverted(), "claim reverted");
+        assertFalse(handler.claimMismatch(), "claim paid other than pendingRewards promised");
+        assertFalse(handler.withdrawReverted(), "withdraw of held shares reverted");
     }
 
     /// forge-config: default.invariant.runs = 128
@@ -285,8 +316,8 @@ contract SystemInvariantTest is CheeseBase {
         assertLe(controller.fundedBlocks(), uint64(3) * H + 60_000);
     }
 
-    /// @dev Exact form (sum of pending <= reserve) fails by a wei: reported as a finding with a proof. Here the
-    ///      shortfall is bounded by one wei per account per farm so any larger leak still fails.
+    /// @dev Debts round up and the accumulator rounds down, so what every account is owed never exceeds what
+    ///      the farm holds for rewards plus what its pool could pull now. Exact, no tolerance.
     /// forge-config: default.invariant.runs = 128
     /// forge-config: default.invariant.depth = 48
     function invariant_rewardsOwedBoundedByReserve() public view {
@@ -299,7 +330,7 @@ contract SystemInvariantTest is CheeseBase {
         // pendingRewards includes unpulled pool emission; add it to the reserve side.
         uint256 ethPool = controller.previewPoolEmission(1);
         uint256 cheesePool = controller.previewPoolEmission(0);
-        assertLe(ethOwed, ethFarm.rewardReserve() + ethPool + players.length, "ETH farm rewards owed");
-        assertLe(cheeseOwed, cheeseFarm.rewardReserve() + cheesePool + players.length, "CHEESE farm rewards owed");
+        assertLe(ethOwed, ethFarm.rewardReserve() + ethPool, "ETH farm rewards owed");
+        assertLe(cheeseOwed, cheeseFarm.rewardReserve() + cheesePool, "CHEESE farm rewards owed");
     }
 }
